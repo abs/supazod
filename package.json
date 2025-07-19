@@ -24,7 +24,7 @@
   },
   "scripts": {
     "build": "npm run clean && tsup",
-    "prepare": "pnpm run build",
+    "prepare": "npm run build",
     "clean": "rm -rf dist",
     "dev": "tsup --watch",
     "example": "node --loader=ts-node/esm --experimental-specifier-resolution=node ./src/cli.ts -i ./example/types.ts -o ./example/schema.ts -t ./example/schema.d.ts",
