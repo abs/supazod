@@ -24,9 +24,7 @@ const simplifiedJSDocTagSchema = z.object({
 });
 
 const getSchemaNameSchema = z.function().args(z.string()).returns(z.string());
-
 const nameFilterSchema = z.function().args(z.string()).returns(z.boolean());
-
 const jSDocTagFilterSchema = z
   .function()
   .args(z.array(simplifiedJSDocTagSchema))
@@ -73,26 +71,15 @@ async function collectTypes(
 
   function transform(context: ts.TransformationContext) {
     return (node: ts.Node): ts.Node => {
-      // Convert empty array types to unknown[]
-      // This transformation handles two cases:
-      // 1. Empty array type `[]`
-      // 2. Empty tuple type `[]` (represented as TupleType in TypeScript AST)
-      //
-      // Examples:
-      // - Relationships: [] -> Relationships: unknown[]
-      // - EmptyList: [] -> EmptyList: unknown[]
       if (
         ts.isPropertySignature(node) &&
         node.type &&
-        // Case 1: Check for empty array type
         ((ts.isArrayTypeNode(node.type) &&
           (!node.type.elementType ||
             node.type.elementType.kind === ts.SyntaxKind.LastTypeNode)) ||
-          // Case 2: Check for empty tuple type
           (node.type.kind === ts.SyntaxKind.TupleType &&
             (node.type as ts.TupleTypeNode).elements.length === 0))
       ) {
-        // Create new property signature with type unknown[]
         return ts.factory.updatePropertySignature(
           node,
           node.modifiers,
@@ -118,17 +105,11 @@ async function collectTypes(
 
   result.dispose();
 
-  const schemaParsedTypes = transformTypes({
-    sourceText: processedSourceText,
-    ...opts,
-  });
-
-  return schemaParsedTypes;
+  return transformTypes({ sourceText: processedSourceText, ...opts });
 }
 
 export default async function supabaseToZod(opts: SupabaseToZodOptions) {
   const result = await generateContent(opts);
-
   if (!result) {
     logger.error('Failed to generate schemas', '❌');
     return;
@@ -162,81 +143,77 @@ export async function generateContent(opts: SupabaseToZodOptions) {
     logger.warn(`No schema specified, using all available schemas`, '🤖');
     opts.schema = getAllSchemas(sourceText);
   }
-
-  if (!opts.schema.length) {
-    throw new Error('No schemas specified');
-  }
+  if (!opts.schema.length) throw new Error('No schemas specified');
 
   logger.info(`Detected schemas: ${opts.schema.join(', ')}`, '📋');
 
   let parsedTypes = '';
-
   logger.info('Transforming types...', '🔄');
   for (const schema of opts.schema) {
-    const schemaParsedTypes = await collectTypes(sourceText, {
-      ...opts,
-      schema,
-    });
-    parsedTypes += schemaParsedTypes;
+    parsedTypes += await collectTypes(sourceText, { ...opts, schema });
   }
 
   logger.info('Generating Zod schemas...', '📠');
+  const { getZodSchemasFile, getInferredTypes, errors } = generate({
+    sourceText: parsedTypes,
+    ...opts,
+  });
+  if (errors.length > 0) throw new Error('Schema generation failed.');
 
-  try {
-    const { getZodSchemasFile, getInferredTypes, errors } = generate({
-      sourceText: parsedTypes,
-      ...opts,
-    });
+  // 1) switch generated import to Astro's Zod
+  let zodSchemasFile = getZodSchemasFile(getImportPath(outputPath, inputPath));
+  zodSchemasFile = zodSchemasFile.replace(
+    /import \{ z \} from ['"]zod['"];/,
+    `import { z } from 'astro:content';`,
+  );
 
-    if (errors.length > 0) {
-      logger.error('Schema generation failed with the following errors:');
-      errors.forEach((error) => logger.error(`- ${error}`));
-      throw new Error('Schema generation failed. See above for details.');
-    }
+  // 2) inject a valid, typed jsonSchema definition
+  zodSchemasFile = zodSchemasFile.replace(
+    /export const jsonSchema[\s\S]*?;\n/m,
+    `export const jsonSchema: z.ZodType<Json> = z.lazy(() =>
+  z.union([
+    z.string(),
+    z.number(),
+    z.boolean(),
+    z.null(),
+    z.record(z.string(), jsonSchema),
+    z.array(jsonSchema),
+  ])
+);
+`,
+  );
 
-    const zodSchemasFile = getZodSchemasFile(
-      getImportPath(outputPath, inputPath),
+  // 3) alias publicAccountRowSchema as accountRowSchema
+  zodSchemasFile +=
+    '\nexport { publicAccountRowSchema as accountRowSchema };\n';
+
+  const contentWithNewComment = replaceGeneratedComment(zodSchemasFile);
+  const formatterSchemasFileContent = await prettier.format(
+    contentWithNewComment,
+    { parser: 'babel-ts' },
+  );
+
+  if (opts.typesOutput) {
+    const typesOutputPath = join(process.cwd(), opts.typesOutput);
+    let typesContent = getInferredTypes(
+      getImportPath(typesOutputPath, outputPath),
     );
-
-    const contentWithNewComment = replaceGeneratedComment(zodSchemasFile);
-
-    const formatterSchemasFileContent = await prettier.format(
-      contentWithNewComment,
-      {
-        parser: 'babel-ts',
-      },
+    typesContent = transformTypeNames(typesContent, opts.typeNameTransformer);
+    const typesWithNewComment = replaceGeneratedComment(typesContent);
+    const formatterTypesFileContent = await prettier.format(
+      typesWithNewComment,
+      { parser: 'babel-ts' },
     );
-
-    if (opts.typesOutput) {
-      const typesOutputPath = join(process.cwd(), opts.typesOutput);
-
-      const zodSchemasImportPath = getImportPath(typesOutputPath, outputPath);
-      let typesContent = getInferredTypes(zodSchemasImportPath);
-
-      typesContent = transformTypeNames(typesContent, opts.typeNameTransformer);
-
-      const typesWithNewComment = replaceGeneratedComment(typesContent);
-
-      const formatterTypesFileContent = await prettier.format(
-        typesWithNewComment,
-        {
-          parser: 'babel-ts',
-        },
-      );
-
-      return {
-        rawSchemasFileContent: contentWithNewComment,
-        rawTypesFileContent: typesWithNewComment,
-        formatterSchemasFileContent,
-        formatterTypesFileContent,
-      };
-    }
-
     return {
       rawSchemasFileContent: contentWithNewComment,
+      rawTypesFileContent: typesWithNewComment,
       formatterSchemasFileContent,
+      formatterTypesFileContent,
     };
-  } catch (error) {
-    throw new Error('Failed to generate schemas: ' + error);
   }
+
+  return {
+    rawSchemasFileContent: contentWithNewComment,
+    formatterSchemasFileContent,
+  };
 }
